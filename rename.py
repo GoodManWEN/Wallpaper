@@ -155,3 +155,4 @@ while dir_list:
                         # 重命名失败：已存在同名文件
                         os.remove(_file)
         print('.', end='')
+print('\nDone.')
