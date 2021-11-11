@@ -20,8 +20,14 @@ def img_phash_bin_parser(file_path: str) -> str:
         name, ext2 = os.path.splitext(_)
         if ext2 == '.dc' and len(name) > MIN_HASH_LENGTH and CHAR_PATT.match(name).end() == len(name):
             # 合法的phash格式
-            return bin(int.from_bytes(base64.b64decode(name.replace('-','/')), byteorder='big'))[2:].zfill(MIN_HASH_LENGTH_BIN)
-    return False
+            return (
+                bin(int.from_bytes(base64.b64decode(name.replace('-','/')), byteorder='big'))[2:].zfill(MIN_HASH_LENGTH_BIN),
+                name.replace('-','/')
+            )
+    return False, ""
+
+def img_phash_bin_encoder(file_path_full):
+    ...
 
 def img_loader_and_rgb_resize(file_path: str) -> np.ndarray:
     img = Image.open(file_path)
@@ -31,16 +37,18 @@ def img_loader_and_rgb_resize(file_path: str) -> np.ndarray:
     else:
         nwidth, nheight = HSIZE, WSIZE
     img_rgb = img.convert("RGB")
-    img_resized = img_rgb.resize((nwidth, nheight), Image.BICUBIC)
+    img_resized = img_rgb.resize((nwidth + 1, nheight + 1), Image.BICUBIC)
     img_matrix = np.asarray(img_resized)
     return img_matrix
 
 def compute_perceptual_hash(array: np.ndarray) -> str:
     array = array.astype(np.int16)
     h_diff = array - np.roll(array, 1, axis = 1)
+    h_diff = h_diff[1:,1:]
     h_diff[h_diff >= 0] = 1
     h_diff = np.maximum(h_diff, 0)
     v_diff = array - np.roll(array, 1, axis = 0)
+    v_diff = v_diff[1:,1:]
     v_diff[v_diff >= 0] = 1
     v_diff = np.maximum(v_diff, 0)
     phash = np.concatenate((
@@ -78,6 +86,37 @@ def imge_value_compute(file_path1: str, file_path2: str) -> int:
     else:
         return 0
 
+def image_dedup(phash_set, orn_key, new_phash, new_phash_bin, new_img_path, _main_dir):
+    try:
+        orn_img_path = phash_set[orn_key]
+        which_one_to_delete = imge_value_compute(orn_img_path, new_img_path)
+    except Exception as e:
+        print(orn_img_path)
+        # print(new_phash_bin)
+        print(new_img_path)
+        print(_main_dir)
+        raise e
+    if which_one_to_delete == 1:
+        # 删除新的
+        os.remove(new_img_path)
+    else:
+        # 删除旧的
+        os.remove(orn_img_path)
+        del phash_set[orn_key]
+        ext = os.path.splitext(new_img_path)[1]
+        new_name = f"{new_phash.replace('/', '-')}.dc{ext}"
+        new_name_full = os.path.join(_main_dir, new_name)
+        try:
+            os.rename(new_img_path, new_name_full)
+            phash_set[new_phash_bin] = new_name_full
+        except Exception as e:
+            if isinstance(e , FileExistsError):
+                # 重命名失败：已存在同名文件
+                os.remove(new_img_path)
+            else:
+                raise e
+        return True
+
 class PhashSet(dict):
 
     def __init__(self, *args, **kwargs):
@@ -86,25 +125,14 @@ class PhashSet(dict):
     def add(self, key, value) -> bool:
         sim_key = self._exists_file(key)
         if sim_key:
-            orn_img_path = self[sim_key]
-            new_img_path = value 
-            which_one_to_delete = imge_value_compute(orn_img_path, new_img_path)
-            if which_one_to_delete == 1:
-                # 删除新的
-                return False # 未添加成功
-            else:
-                # 删除旧的
-                os.remove(orn_img_path)
-                del self[sim_key]
-                self[key] = value
-                return True
+            return False, sim_key
         else:
             self[key] = value
-            return True
+            return True, ''
 
     def _exists_file(self, phash: str) -> str:
         for key in tuple(self.keys()):
-            if hamming_distance(key, phash) <= 32:
+            if hamming_distance(key, phash) <= 26:
                 return key
         return False
 
@@ -133,20 +161,22 @@ while dir_list:
     for _file in _files:
         name , ext = os.path.splitext(_file)
         file_path_full = os.path.join(_main_dir, _file)
-        phash_bin = img_phash_bin_parser(file_path_full)
+        phash_bin, phash = img_phash_bin_parser(file_path_full)
         if phash_bin:
             # 已扫描过的文件
-            if not phash_set.add(phash_bin, file_path_full):
-                os.remove(file_path_full)
+            add_success, _ = phash_set.add(phash_bin, file_path_full)
+            if not add_success:
+                image_dedup(phash_set, _, phash, phash_bin, file_path_full, _main_dir)
         else:
             # 未经扫描的文件
             img_phash = compute_perceptual_hash(img_loader_and_rgb_resize(file_path_full))
             img_phash_bin = bin(int.from_bytes(base64.b64decode(img_phash), byteorder='big'))[2:].zfill(MIN_HASH_LENGTH_BIN)
             new_name = f"{img_phash.replace('/', '-')}.dc{ext}"
             new_name_full = os.path.join(_main_dir, new_name)
-            if not phash_set.add(img_phash_bin, file_path_full):
+            add_success, _ = phash_set.add(img_phash_bin, new_name_full)
+            if not add_success:
                 # 添加失败，重复文件
-                os.remove(file_path_full)
+                image_dedup(phash_set, _, img_phash, img_phash_bin, file_path_full, _main_dir)
             else:
                 try:
                     os.rename(file_path_full, new_name_full)
