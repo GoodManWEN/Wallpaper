@@ -12,6 +12,11 @@ WSIZE, HSIZE = 16, 9
 MIN_HASH_LENGTH = (WSIZE * HSIZE) * 6 // 8
 MIN_HASH_LENGTH_BIN = (WSIZE * HSIZE) * 6
 CHAR_PATT = re.compile('[a-zA-Z0-9+\-]+')
+DIFF_SIZE = 26 # 涉及储存结构，需要能够+1整除
+DIFF_RANGE_SIZE = (WSIZE * HSIZE) * 6 / (DIFF_SIZE + 1)
+if (DIFF_RANGE_SIZE - int(DIFF_RANGE_SIZE)) != 0:
+    raise ValueError('错误，原因参上')
+DIFF_RANGE_SIZE = int(DIFF_RANGE_SIZE)
 
 def img_phash_bin_parser(file_path: str) -> str:
     _ = os.path.split(file_path)[1]
@@ -81,59 +86,86 @@ def imge_value_compute(file_path1: str, file_path2: str) -> int:
     img2_webp_v = 100 if os.path.splitext(file_path2)[1] == '.webp' else 0
     img1_v = img1_res_v * img1_sz_v + img1_webp_v
     img2_v = img2_res_v * img2_sz_v + img2_webp_v
-    if img1_v >= img2_v:
+    if img1_v > img2_v:
+        # 保留旧的
         return 1 
-    else:
+    elif img1_v < img2_v:
         return 0
+    else:
+        # 相同时保留旧的
+        if os.stat(file_path1).st_mtime <= os.stat(file_path2).st_mtime:
+            return 1
+        else:
+            return 0
+
 
 def image_dedup(phash_set, orn_key, new_phash, new_phash_bin, new_img_path, _main_dir):
-    try:
-        orn_img_path = phash_set[orn_key]
-        which_one_to_delete = imge_value_compute(orn_img_path, new_img_path)
-    except Exception as e:
-        print(orn_img_path)
-        # print(new_phash_bin)
-        print(new_img_path)
-        print(_main_dir)
-        raise e
+    orn_img_path = phash_set[orn_key][1]
+    which_one_to_delete = imge_value_compute(orn_img_path, new_img_path)
     if which_one_to_delete == 1:
         # 删除新的
         os.remove(new_img_path)
     else:
         # 删除旧的
         os.remove(orn_img_path)
-        del phash_set[orn_key]
+        phash_set[orn_key][0] = False
         ext = os.path.splitext(new_img_path)[1]
         new_name = f"{new_phash.replace('/', '-')}.dc{ext}"
         new_name_full = os.path.join(_main_dir, new_name)
         try:
             os.rename(new_img_path, new_name_full)
-            phash_set[new_phash_bin] = new_name_full
+            phash_set[new_phash_bin] = [True, new_name_full]
         except Exception as e:
             if isinstance(e , FileExistsError):
                 # 重命名失败：已存在同名文件
                 os.remove(new_img_path)
             else:
                 raise e
-        return True
 
 class PhashSet(dict):
 
     def __init__(self, *args, **kwargs):
+        '''
+        内存结构，二进制hash为key，value为（boll，地址），其中boll表示是否还有效，没有删除。
+        _index_structure是27个簇，类似内存索引
+        _memory_reduce_map是给每个binhash一个int做索引，以避免直接储存binhash的内存浪费
+        '''
         super().__init__(*args, **kwargs)
+        self._index_structure = [{} for _ in range(DIFF_SIZE + 1)]
+        self._memory_reduce_map = []
     
     def add(self, key, value) -> bool:
         sim_key = self._exists_file(key)
         if sim_key:
             return False, sim_key
         else:
-            self[key] = value
+            key_id = len(self._memory_reduce_map) # 唯一指定id
+            self._memory_reduce_map.append(key)
+            for _ in range(DIFF_SIZE + 1):
+                key_sep_hash = int(key[_*DIFF_RANGE_SIZE:(_+1)*DIFF_RANGE_SIZE], 2)
+                target = self._index_structure[_].setdefault(key_sep_hash, set())
+                target.add(key_id)
+            self[key] = [True, value]
             return True, ''
 
+    def unplug(self, key):
+        self[key][0] = False
+
     def _exists_file(self, phash: str) -> str:
-        for key in tuple(self.keys()):
-            if hamming_distance(key, phash) <= 26:
-                return key
+        target_set = set()
+        for _ in range(DIFF_SIZE + 1):
+            phash_sep_hash = int(phash[_*DIFF_RANGE_SIZE:(_+1)*DIFF_RANGE_SIZE], 2)
+            if phash_sep_hash in self._index_structure[_]:
+                target_set.update(self._index_structure[_][phash_sep_hash])
+            # try:
+            #     target_set.update(self._index_structure[_][phash_sep_hash])
+            # except:
+            #     ...
+        for key_id in target_set:
+            key = self._memory_reduce_map[key_id]
+            if hamming_distance(key, phash) <= DIFF_SIZE:
+                if self[key][0]:
+                    return key
         return False
 
 dir_list = ['.', ]
@@ -183,6 +215,9 @@ while dir_list:
                 except Exception as e:
                     if isinstance(e , FileExistsError):
                         # 重命名失败：已存在同名文件
-                        os.remove(_file)
+                        os.remove(file_path_full)
+                        phash_set.unplug(img_phash_bin)
+
+
         print('.', end='')
 print('\nDone.')
