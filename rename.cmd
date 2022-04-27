@@ -1,1 +1,2 @@
 python rename.py
+puse
